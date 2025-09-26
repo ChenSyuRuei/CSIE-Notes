@@ -15,6 +15,8 @@ typedef struct {
 
 int handle_read(int fd, request* reqP);
 void reset_request(request * reqP);
+bool opr_read(request req, int new_fd);
+bool opr_write(request req, int new_fd);
 
 // Section Server
 int init_server(unsigned short port);

@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -11,9 +13,8 @@
 
 #include "server.h"
 
-const unsigned char IAC_IP[3] = "\xff\xf4";
+const char IAC_IP[3] = "\xff\xf4";
 
-// Section Request
 int handle_read(int fd, request* reqP) {
     /*  Return value:
      *     -1: read failed
@@ -35,8 +36,6 @@ int handle_read(int fd, request* reqP) {
         p1 = strstr(buf, "\012");   // \n
         if (p1 == NULL) {
             if (!strncmp(buf, IAC_IP, 2)) {
-                // Client presses ctrl+C, regard as disconnection
-                // fprintf(stderr, "Client presses ctrl+C....\n");
                 return 0;
             }
         }
@@ -52,6 +51,101 @@ int handle_read(int fd, request* reqP) {
 void reset_request(request * reqP) {
     reqP->length = 0;
     reqP->buffer[0] = '\0';
+}
+
+bool opr_read(request req, int new_fd){
+    for(int i = 5; i < req.length; i++) {
+        if(!isdigit(req.buffer[i])) {
+            return false;
+        }
+    }
+    int idx = atoi(req.buffer + 5);
+    int note = open("./note.txt", O_RDONLY);
+    int index = open("./index", O_RDONLY);
+    int sum = 0, paragraph_length = -1, count = 0;
+    unsigned char hex;
+    while (read(index, &hex, 1) > 0) {
+        int value = (int)hex;
+        if(count == idx){
+            paragraph_length = value;
+            break;
+        }
+        sum += value;
+        count++;
+    }
+    if(idx >= count && paragraph_length == -1){
+        return false;
+    }
+    char content[paragraph_length + 1];
+    if(lseek(note, sum, SEEK_SET) != -1){
+        read(note, content, paragraph_length);
+    }
+    write(new_fd, content, paragraph_length);
+    return true;
+}
+
+bool opr_write(request req, int new_fd){
+    int content_start = -1;
+    for (int i = 7; i < req.length; i++) {
+        if (!isdigit(req.buffer[i])) {
+            if (req.buffer[i] == ' ') {
+                req.buffer[i] = '\0';
+                content_start = i + 1;
+                break;
+            }
+            else {
+                return false;
+            }
+        }
+    }
+    if (content_start == -1) {
+        return false;
+    }
+
+    int idx = atoi(req.buffer + 7);
+    int note = open("./note.txt", O_RDWR);
+    int index = open("./index", O_RDWR);
+    int head_length = 0, paragraph_length = -1, paragraph_count = 0;
+    unsigned char hex;
+    while (read(index, &hex, 1) > 0) {
+        int value = (int)hex;
+        if (paragraph_count == idx) {
+            paragraph_length = value;
+            break;
+        }
+        head_length += value;
+        paragraph_count++;
+    }
+    if (idx >= paragraph_count && paragraph_length == -1) {
+        return false;
+    }
+    int content_length = strlen(req.buffer + content_start);
+    if (content_length > MESSAGE_SIZE) {
+        content_length = MESSAGE_SIZE;
+    }
+    char content[content_length + 1];
+    memmove(content, req.buffer + content_start, content_length);
+    content[content_length] = '\0';
+
+    int file_length = lseek(note, 0, SEEK_END);
+    int tail_length = file_length - head_length - paragraph_length;
+
+    char tail[tail_length];
+    if (lseek(note, head_length + paragraph_length, SEEK_SET) != -1) {
+        read(note, tail, tail_length);
+    }
+    if (lseek(note, head_length, SEEK_SET) != -1) {
+        write(note, content, content_length);
+        write(note, tail, tail_length);
+    }
+    if(paragraph_length > content_length){
+        ftruncate(note, head_length + content_length + tail_length);
+    }
+    unsigned char new_hex = (unsigned char)content_length;
+    if(lseek(index, paragraph_count, SEEK_SET) != -1){
+        write(index, &new_hex, 1);
+    }
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -92,6 +186,23 @@ int main(int argc, char** argv) {
         int ret = handle_read(new_fd, &req);
         if (ret > 0) {
             printf("read from client: %s\n", req.buffer);
+            if(strncmp(req.buffer, "read ", 5) == 0) {
+                if(!opr_read(req, new_fd)){
+                    write(new_fd, "Invalid command\n", 17);
+                }
+            }
+            else if(strncmp(req.buffer, "update ", 7) == 0) {
+                if(!opr_write(req, new_fd)){
+                    write(new_fd, "Invalid command\n", 17);
+                }
+            }
+            else if(strncmp(req.buffer, "exit", 5) == 0) {
+                close(new_fd);
+                break;
+            }
+            else{
+                write(new_fd, "Invalid command\n", 16);
+            }
             reset_request(&req);
         } else {
             // Close connection
