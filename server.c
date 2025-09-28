@@ -13,57 +13,100 @@
 
 #include "server.h"
 
+#ifndef min
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+
 const char IAC_IP[3] = "\xff\xf4";
 
-int handle_read(int fd, request* reqP) {
-    /*  Return value:
-     *     -1: read failed
-     *      0: EOF (client down)
-     *      1: read successfully
+int handle_read(Client* cltP) {
+    /*
+     * 返回值:
+     * -1: 讀取失敗
+     *  0: EOF (客戶端已離線)
+     *  1: 已讀取一條完整的指令
+     *  2: 只讀到部分指令，需要更多資料
      */
+
+    // 計算請求緩衝區剩餘的空間，減 1 是為了保留給 null-terminator ('\0')
+    size_t space_left = BUFFER_SIZE - cltP->rlength - 1;
+
+    // 從 socket 讀取資料到一個臨時的緩衝區
+    bool command_complete = false;
     int r;
-    char buf[BUFFER_SIZE];
+    char buffer[BUFFER_SIZE];    
     size_t len;
 
-    memset(buf, 0, sizeof(buf));
-
-    // Read in request from client
-    r = read(fd, buf, sizeof(buf));
+    memset(buffer, 0, sizeof(buffer));
+    r = read(cltP->fd, buffer, sizeof(buffer));
     if (r < 0) return -1;
     if (r == 0) return 0;
-    char* p1 = strstr(buf, "\015\012"); // \r\n
+    char* p1 = strstr(buffer, "\015\012"); // \r\n
     if (p1 == NULL) {
-        p1 = strstr(buf, "\012");   // \n
+        p1 = strstr(buffer, "\012");   // \n
         if (p1 == NULL) {
-            if (!strncmp(buf, IAC_IP, 2)) {
+            if (!strncmp(buffer, IAC_IP, 2)) {
                 return 0;
             }
-        }
-    }
+        } else command_complete = true;
+    } else command_complete = true;
 
-    len = min(p1 - buf, BUFFER_SIZE - reqP->length - 1); // with padding
-    memmove(reqP->buffer + reqP->length, buf, len);
-    reqP->length += len;
-    reqP->buffer[reqP->length] = '\0';
-    return 1;
+    // 將新讀取的資料附加到主請求緩衝區
+    len = min((p1 == NULL) ? r : (p1 - buffer), space_left);
+    memcpy(cltP->rbuffer + cltP->rlength, buffer, len);
+    cltP->rlength += len;
+    cltP->rbuffer[cltP->rlength] = '\0'; // 始終保持緩衝區以 null-terminator 結尾
+
+    if (command_complete) return 1;
+    return 2;
 }
 
-void reset_request(request * reqP) {
-    reqP->length = 0;
-    reqP->buffer[0] = '\0';
+void handle_write(Client* cltP, char* msg, int len){
+    memcpy(cltP->wbuffer, msg, len);
+    cltP->wlength = len;
+    cltP->wbuffer[len] = '\0';
+    cltP->pollout = POLLOUT;
 }
 
-bool opr_read(request req, int new_fd){
-    for(int i = 5; i < req.length; i++) {
-        if(!isdigit(req.buffer[i])) {
+void reset_client(Client* cltP) {
+    cltP->rlength = 0;
+    cltP->rbuffer[0] = '\0';
+}
+
+void init_client(int fdP, Client* cltP) {
+    cltP->fd = fdP;
+    cltP->rlength = 0;
+    cltP->rbuffer[0] = '\0';
+    cltP->wlength = 0;
+    cltP->wbuffer[0] = '\0';
+    cltP->pollout = 0;
+    cltP->previous = NULL;
+    cltP->next = NULL;
+}
+
+void disconnect_client(Client* cltP) {
+    close(cltP->fd);
+    cltP->previous->next = cltP->next;
+    if(cltP->next != NULL) cltP->next->previous = cltP->previous;
+    Client *temp = cltP;
+    cltP = cltP->previous;
+    free(temp);
+    printf("client disconnected\n");
+}
+
+bool opr_read(Client* cltP){
+    for(int i = 5; i < cltP->rlength; i++) {
+        if(!isdigit(cltP->rbuffer[i])) {
             return false;
         }
     }
-    int idx = atoi(req.buffer + 5);
+
+    int idx = atoi(cltP->rbuffer + 5);
     int note = open("./note.txt", O_RDONLY);
     int index = open("./index", O_RDONLY);
     int sum = 0, paragraph_length = -1, count = 0;
     unsigned char hex;
+
     while (read(index, &hex, 1) > 0) {
         int value = (int)hex;
         if(count == idx){
@@ -76,20 +119,23 @@ bool opr_read(request req, int new_fd){
     if(idx >= count && paragraph_length == -1){
         return false;
     }
+
     char content[paragraph_length + 1];
     if(lseek(note, sum, SEEK_SET) != -1){
         read(note, content, paragraph_length);
     }
-    write(new_fd, content, paragraph_length);
+
+    handle_write(cltP, content, paragraph_length);
+
     return true;
 }
 
-bool opr_write(request req, int new_fd){
+bool opr_write(Client* cltP){
     int content_start = -1;
-    for (int i = 7; i < req.length; i++) {
-        if (!isdigit(req.buffer[i])) {
-            if (req.buffer[i] == ' ') {
-                req.buffer[i] = '\0';
+    for (int i = 7; i < cltP->rlength; i++) {
+        if (!isdigit(cltP->rbuffer[i])) {
+            if (cltP->rbuffer[i] == ' ') {
+                cltP->rbuffer[i] = '\0';
                 content_start = i + 1;
                 break;
             }
@@ -102,7 +148,7 @@ bool opr_write(request req, int new_fd){
         return false;
     }
 
-    int idx = atoi(req.buffer + 7);
+    int idx = atoi(cltP->rbuffer + 7);
     int note = open("./note.txt", O_RDWR);
     int index = open("./index", O_RDWR);
     int head_length = 0, paragraph_length = -1, paragraph_count = 0;
@@ -119,12 +165,12 @@ bool opr_write(request req, int new_fd){
     if (idx >= paragraph_count && paragraph_length == -1) {
         return false;
     }
-    int content_length = strlen(req.buffer + content_start);
+    int content_length = strlen(cltP->rbuffer + content_start);
     if (content_length > MESSAGE_SIZE) {
         content_length = MESSAGE_SIZE;
     }
     char content[content_length + 1];
-    memmove(content, req.buffer + content_start, content_length);
+    memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
 
     int file_length = lseek(note, 0, SEEK_END);
@@ -149,20 +195,17 @@ bool opr_write(request req, int new_fd){
 }
 
 int main(int argc, char** argv) {
-
-    // Parse args.
     if (argc != 2) {
         fprintf(stderr, "usage: %s [port]\n", argv[0]);
         exit(1);
     }
 
-    int listen_fd, new_fd;
+    int listen_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addrlen = sizeof(client_addr);
     unsigned short port = (unsigned short) atoi(argv[1]);
     char buffer[BUFFER_SIZE];
 
-    // Initialize server socket
     listen_fd = init_server(port);
     if (listen_fd < 0) {
         fprintf(stderr, "Failed to initialize server.\n");
@@ -171,44 +214,83 @@ int main(int argc, char** argv) {
 
     printf("Server listening on port %d\n", port);
 
-    // Create one client
-    request req;
-    reset_request(&req);
+    int clt_num = 1, clt_size = 2;
+    Client clt;
+    Client *tail = &clt;
+    struct pollfd *fdarr = (struct pollfd *)malloc(clt_size * sizeof(struct pollfd));
 
-    // Blocking accept
-    new_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addrlen);
-    if (new_fd == -1) {
-        perror("accept");
-    }
+    init_client(listen_fd, &clt);
+    fdarr[0] = (struct pollfd){listen_fd, POLLIN, 0};
+    int fdarr_it;
 
-    while (1) {
-        // Blocking read
-        int ret = handle_read(new_fd, &req);
-        if (ret > 0) {
-            printf("read from client: %s\n", req.buffer);
-            if(strncmp(req.buffer, "read ", 5) == 0) {
-                if(!opr_read(req, new_fd)){
-                    write(new_fd, "Invalid command\n", 17);
+    while (true) {
+        fdarr_it = 1;
+        for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
+            fdarr[fdarr_it] = (struct pollfd){it->fd, POLLIN | it->pollout, 0};
+        }
+        int totalFds = poll(fdarr, clt_num, -1);
+
+        if(totalFds < 0){
+            perror("poll");
+        }
+        else if(totalFds == 0){
+            continue;
+        }
+        else{
+            fdarr_it = 1;
+            for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
+                if(fdarr[fdarr_it].revents & POLLOUT){
+                    write(it->fd, it->wbuffer, it->wlength);
+                    it->pollout = 0;
+                }
+                if(fdarr[fdarr_it].revents & POLLIN){
+                    int ret = handle_read(it);
+                    if (ret == 1) {
+                        printf("read from client: %s\n", it->rbuffer);
+                        if(strncmp(it->rbuffer, "read ", 5) == 0) {
+                            if(!opr_read(it)){
+                                handle_write(it, "Invalid command", 15);
+                            }
+                            reset_client(it);
+                        }
+                        else if(strncmp(it->rbuffer, "update ", 7) == 0) {
+                            if(!opr_write(it)){
+                                handle_write(it, "Invalid command", 15);
+                            }
+                            reset_client(it);
+                        }
+                        else if(strncmp(it->rbuffer, "exit", 5) == 0) {
+                            disconnect_client(it);
+                            clt_num--;
+                        }
+                        else{
+                            handle_write(it, "Invalid command", 15);
+                            reset_client(it);
+                        }
+                    }
+                    else if(ret <= 0){ // client disconnected or error
+                        disconnect_client(it);
+                        clt_num--;
+                    }
                 }
             }
-            else if(strncmp(req.buffer, "update ", 7) == 0) {
-                if(!opr_write(req, new_fd)){
-                    write(new_fd, "Invalid command\n", 17);
+            if(fdarr[0].revents & POLLIN){
+                int new_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addrlen);
+                if (new_fd == -1) {
+                    perror("accept");
                 }
+                Client *new_clt = (Client *)malloc(sizeof(Client));
+                init_client(new_fd, new_clt);
+                tail->next = new_clt;
+                new_clt->previous = tail;
+                tail = new_clt;
+                clt_num++;
+                if(clt_num == clt_size){
+                    clt_size *= 2;
+                    fdarr = (struct pollfd *)realloc(fdarr, clt_size * sizeof(struct pollfd));
+                }
+                printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
             }
-            else if(strncmp(req.buffer, "exit", 5) == 0) {
-                close(new_fd);
-                break;
-            }
-            else{
-                write(new_fd, "Invalid command\n", 16);
-            }
-            reset_request(&req);
-        } else {
-            // Close connection
-            printf("client disconnected\n");
-            close(new_fd);
-            break;
         }
     }
 
@@ -247,7 +329,7 @@ int init_server(unsigned short port) {
     }
 
     // Start listening
-    if (listen(listen_fd, BACKLOG) == -1) {
+    if (listen(listen_fd, 10) == -1) { // Using 10 for backlog
         perror("listen");
         close(listen_fd);
         return -1;

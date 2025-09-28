@@ -8,15 +8,24 @@
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
 
 // Section Request
-typedef struct {
-    size_t length;
-    char buffer[BUFFER_SIZE];
-} request;
+typedef struct client{
+    int fd;
+    size_t rlength;
+    char rbuffer[BUFFER_SIZE];
+    size_t wlength;
+    char wbuffer[BUFFER_SIZE];
+    short pollout;
+    struct client *previous;
+    struct client *next;
+} Client;
 
-int handle_read(int fd, request* reqP);
-void reset_request(request * reqP);
-bool opr_read(request req, int new_fd);
-bool opr_write(request req, int new_fd);
+int handle_read(Client* cltP);
+void handle_write(Client* cltP, char* msg, int len);
+void reset_client(Client* cltP);
+void init_client(int fdP, Client* cltP);
+void disconnect_client(Client* cltP);
+bool opr_read(Client* cltP);
+bool opr_write(Client* cltP);
 
 // Section Server
 int init_server(unsigned short port);
