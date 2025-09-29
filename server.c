@@ -18,8 +18,6 @@
 #endif
 
 const char IAC_IP[3] = "\xff\xf4";
-int note_fd;
-int index_fd;
 
 int handle_read(Client* cltP) {
     /*
@@ -57,7 +55,7 @@ int handle_read(Client* cltP) {
     len = min((p1 == NULL) ? r : (p1 - buffer), space_left);
     memcpy(cltP->rbuffer + cltP->rlength, buffer, len);
     cltP->rlength += len;
-    cltP->rbuffer[cltP->rlength] = '\0'; // 始終保持緩衝區以 null-terminator 結尾
+    cltP->rbuffer[cltP->rlength] = '\0';
 
     if (command_complete) return 1;
     return 2;
@@ -117,24 +115,13 @@ bool opr_read(Client* cltP){
         return false;
     }
 
-    /*
-    if(first_digit_pos == -1){
-        cltP->rbuffer[5] = '0';
-        cltP->rbuffer[6] = '\0';
-        cltP->rlength = strlen(cltP->rbuffer);
-    }
-    else{
-        memcpy(cltP->rbuffer + 5, cltP->rbuffer + first_digit_pos, cltP->rlength - first_digit_pos);
-        cltP->rbuffer[5 + cltP->rlength - first_digit_pos] = '\0';
-        cltP->rlength = strlen(cltP->rbuffer);
-    }
-    */
-
     int idx = atoi(cltP->rbuffer + 5);
+    int note = open("./note.txt", O_RDONLY);
+    int index = open("./index", O_RDONLY);
     int sum = 0, paragraph_length = -1, count = 0;
     unsigned char hex;
 
-    while (read(index_fd, &hex, 1) > 0) {
+    while (read(index, &hex, 1) > 0) {
         int value = (int)hex;
         if(count == idx){
             paragraph_length = value;
@@ -148,8 +135,8 @@ bool opr_read(Client* cltP){
     }
 
     char content[paragraph_length + 1];
-    if(lseek(note_fd, sum, SEEK_SET) != -1){
-        read(note_fd, content, paragraph_length);
+    if(lseek(note, sum, SEEK_SET) != -1){
+        read(note, content, paragraph_length);
     }
 
     handle_write(cltP, content, paragraph_length);
@@ -176,9 +163,11 @@ bool opr_write(Client* cltP){
     }
 
     int idx = atoi(cltP->rbuffer + 7);
+    int note = open("./note.txt", O_RDWR);
+    int index = open("./index", O_RDWR);
     int head_length = 0, paragraph_length = -1, paragraph_count = 0;
     unsigned char hex;
-    while (read(index_fd, &hex, 1) > 0) {
+    while (read(index, &hex, 1) > 0) {
         int value = (int)hex;
         if (paragraph_count == idx) {
             paragraph_length = value;
@@ -198,26 +187,32 @@ bool opr_write(Client* cltP){
     memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
 
-    int file_length = lseek(note_fd, 0, SEEK_END);
+    int file_length = lseek(note, 0, SEEK_END);
     int tail_length = file_length - head_length - paragraph_length;
 
     char tail[tail_length];
-    if (lseek(note_fd, head_length + paragraph_length, SEEK_SET) != -1) {
-        read(note_fd, tail, tail_length);
+    if (lseek(note, head_length + paragraph_length, SEEK_SET) != -1) {
+        read(note, tail, tail_length);
     }
-    if (lseek(note_fd, head_length, SEEK_SET) != -1) {
-        write(note_fd, content, content_length);
-        write(note_fd, tail, tail_length);
+    if (lseek(note, head_length, SEEK_SET) != -1) {
+        write(note, content, content_length);
+        write(note, tail, tail_length);
     }
     if(paragraph_length > content_length){
-        ftruncate(note_fd, head_length + content_length + tail_length);
+        ftruncate(note, head_length + content_length + tail_length);
     }
-    printf("head length:%d paragraph length:%d tail_length:%d\n", head_length, paragraph_length, tail_length);
     unsigned char new_hex = (unsigned char)content_length;
-    printf("content length:%d\n", content_length);
-    if(lseek(index_fd, paragraph_count, SEEK_SET) != -1){
-        write(index_fd, &new_hex, 1);
+    if(lseek(index, paragraph_count, SEEK_SET) != -1){
+        write(index, &new_hex, 1);
     }
+
+    if(fdatasync(note) == -1){
+        perror("sync note");
+    }
+    if(fdatasync(index) == -1){
+        perror("sync index");
+    }
+
     return true;
 }
 
@@ -240,9 +235,6 @@ int main(int argc, char** argv) {
     }
 
     printf("Server listening on port %d\n", port);
-
-    note_fd = open("./note.txt", O_RDWR);
-    index_fd = open("./index", O_RDWR);
 
     int clt_num = 1;
     Client clt;
@@ -317,14 +309,7 @@ int main(int argc, char** argv) {
                 clt_num++;
                 printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
             }
-            if(fdatasync(note_fd) == -1){
-                perror("sync note");
-            }
-            if(fdatasync(index_fd) == -1){
-                perror("sync index");
-            }
         }
-
     }
 
     return 0;
