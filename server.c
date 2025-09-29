@@ -310,67 +310,6 @@ int main(int argc, char** argv) {
                 printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
             }
         }
-        int totalFds = poll(fdarr, clt_num, -1);
-
-        if(totalFds < 0){
-            perror("poll");
-        }
-        else if(totalFds == 0){
-            continue;
-        }
-        else{
-            fdarr_it = 1;
-            for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
-                if(fdarr[fdarr_it].revents & POLLOUT){
-                    write(it->fd, it->wbuffer, it->wlength);
-                    it->pollout = 0;
-                }
-                if(fdarr[fdarr_it].revents & POLLIN){
-                    int ret = handle_read(it);
-                    if (ret == 1) {
-                        printf("read from client: %s\n", it->rbuffer);
-                        if(strncmp(it->rbuffer, "read ", 5) == 0) {
-                            if(!opr_read(it)){
-                                handle_write(it, "Invalid command", 15);
-                            }
-                            reset_client(it);
-                        }
-                        else if(strncmp(it->rbuffer, "update ", 7) == 0) {
-                            if(!opr_write(it)){
-                                handle_write(it, "Invalid command", 15);
-                            }
-                            reset_client(it);
-                        }
-                        else if(strncmp(it->rbuffer, "exit", 5) == 0) {
-                            disconnect_client(it);
-                            clt_num--;
-                        }
-                        else{
-                            handle_write(it, "Invalid command", 15);
-                            reset_client(it);
-                        }
-                    }
-                    else if(ret <= 0){ // client disconnected or error
-                        disconnect_client(it);
-                        clt_num--;
-                    }
-                }
-            }
-            if(fdarr[0].revents & POLLIN){
-                int new_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addrlen);
-                if (new_fd == -1) {
-                    perror("accept");
-                }
-                Client *new_clt = (Client *)malloc(sizeof(Client));
-                init_client(new_fd, new_clt);
-                tail->next = new_clt;
-                new_clt->previous = tail;
-                tail = new_clt;
-                clt_num++;
-                printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
-            }
-        }
-
     }
 
     return 0;
