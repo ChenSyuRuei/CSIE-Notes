@@ -21,29 +21,26 @@ const char IAC_IP[3] = "\xff\xf4";
 
 int handle_read(Client* cltP) {
     /*
-     * 返回值:
-     * -1: 讀取失敗
-     *  0: EOF (客戶端已離線)
-     *  1: 已讀取一條完整的指令
-     *  2: 只讀到部分指令，需要更多資料
-     */
+        return value:
+        -1: read failed
+        0: EOF (client has disconnected)
+        1: read a whole command
+        2: only read a fragment of command, need more reading
+    */
 
-    // 計算請求緩衝區剩餘的空間，減 1 是為了保留給 null-terminator ('\0')
-    size_t space_left = BUFFER_SIZE - cltP->rlength - 1;
-
-    // 從 socket 讀取資料到一個臨時的緩衝區
     bool command_complete = false;
-    int r;
+    int msg_length;
+    int store_len;
+    int space_left = BUFFER_SIZE - cltP->rlength - 1; // minus 1 for null-terminator
     char buffer[BUFFER_SIZE];    
-    size_t len;
 
     memset(buffer, 0, sizeof(buffer));
-    r = read(cltP->fd, buffer, sizeof(buffer));
-    if (r < 0) return -1;
-    if (r == 0) return 0;
+    msg_length = read(cltP->fd, buffer, sizeof(buffer));
+    if (msg_length < 0) return -1;
+    if (msg_length == 0) return 0;
     char* p1 = strstr(buffer, "\015\012"); // \r\n
     if (p1 == NULL) {
-        p1 = strstr(buffer, "\012");   // \n
+        p1 = strstr(buffer, "\012"); // \n
         if (p1 == NULL) {
             if (!strncmp(buffer, IAC_IP, 2)) {
                 return 0;
@@ -51,10 +48,10 @@ int handle_read(Client* cltP) {
         } else command_complete = true;
     } else command_complete = true;
 
-    // 將新讀取的資料附加到主請求緩衝區
-    len = min((p1 == NULL) ? r : (p1 - buffer), space_left);
-    memcpy(cltP->rbuffer + cltP->rlength, buffer, len);
-    cltP->rlength += len;
+    // restore the coming message in buffer
+    store_len = min((p1 == NULL) ? msg_length : (p1 - buffer), space_left);
+    memcpy(cltP->rbuffer + cltP->rlength, buffer, store_len);
+    cltP->rlength += store_len;
     cltP->rbuffer[cltP->rlength] = '\0';
 
     if (command_complete) return 1;
@@ -95,6 +92,7 @@ void disconnect_client(Client* cltP) {
 }
 
 bool opr_read(Client* cltP){
+    // check if paragraph parameter is valid
     bool nonz_digit = false;
     int first_digit_pos = -1, last_digit_pos = -1;
     for(int i = 5; i < cltP->rlength; i++) {
@@ -111,20 +109,21 @@ bool opr_read(Client* cltP){
             }
         }
     }
-    if(last_digit_pos - first_digit_pos >= 10){
+    if(last_digit_pos - first_digit_pos >= 3){
         return false;
     }
 
+    // open note file
     int idx = atoi(cltP->rbuffer + 5);
     int note = open("./note.txt", O_RDONLY);
-    int index = open("./index", O_RDWR);
+    int index = open("./index", O_RDONLY);
     if (note < 0 || index < 0) {
         if (note >= 0) close(note);
         if (index >= 0) close(index);
         return false;
     }
 
-    // Acquire read lock on [0, idx+1)
+    // acquire read lock on [0, idx+1)
     struct flock rdlock;
     memset(&rdlock, 0, sizeof(rdlock));
     rdlock.l_type = F_RDLCK;
@@ -138,27 +137,41 @@ bool opr_read(Client* cltP){
         return false;
     }
 
-    int sum = 0, paragraph_length = -1, count = 0;
+    // get paragraph length and its start at note
+    int head_length = 0, paragraph_length = -1;
     unsigned char hex;
-
     lseek(index, 0, SEEK_SET);
-    while (read(index, &hex, 1) > 0) {
+    for(int paragraph_count = 0; read(index, &hex, 1) > 0; paragraph_count++){
         int value = (int)hex;
-        if(count == idx){
+        if(paragraph_count == idx){
             paragraph_length = value;
             break;
         }
-        sum += value;
-        count++;
+        head_length += value;
     }
     if(paragraph_length == -1){
         close(note);
         close(index);
         return false;
     }
+
+    // unlock read lock on [0, idx)
+    struct flock unlock;
+    memset(&unlock, 0, sizeof(unlock));
+    unlock.l_type = F_UNLCK;
+    unlock.l_whence = SEEK_SET;
+    unlock.l_start = 0;
+    unlock.l_len = idx;
+    if (fcntl(index, F_SETLK, &unlock) == -1) {
+        perror("fcntl read lock");
+        close(note);
+        close(index);
+        return false;
+    }
+
+    // set content
     char content[paragraph_length + 1];
-    lseek(note, sum, SEEK_SET);
-    read(note, content, paragraph_length);
+    pread(note, content, paragraph_length, head_length);
     content[paragraph_length] = '\0';
 
     handle_write(cltP, content, paragraph_length);
@@ -169,9 +182,12 @@ bool opr_read(Client* cltP){
 }
 
 bool opr_write(Client* cltP){
+    // check if paragraph parameter is valid
     int content_start = -1;
-    for (int i = 7; i < cltP->rlength; i++) {
-        if (!isdigit(cltP->rbuffer[i])) {
+    bool nonz_digit = false;
+    int first_digit_pos = -1, last_digit_pos = -1;
+    for(int i = 7; i < cltP->rlength; i++) {
+        if(!isdigit(cltP->rbuffer[i])) {
             if (cltP->rbuffer[i] == ' ') {
                 cltP->rbuffer[i] = '\0';
                 content_start = i + 1;
@@ -181,11 +197,21 @@ bool opr_write(Client* cltP){
                 return false;
             }
         }
+        else{
+            if(cltP->rbuffer[i] != '0'){
+                if(!nonz_digit){
+                    first_digit_pos = i;
+                    nonz_digit = true;
+                }
+                last_digit_pos = i;
+            }
+        }
     }
-    if (content_start == -1) {
+    if(last_digit_pos - first_digit_pos >= 3 || content_start == -1){
         return false;
     }
 
+    // open note file
     int idx = atoi(cltP->rbuffer + 7);
     int note = open("./note.txt", O_RDWR);
     int index = open("./index", O_RDWR);
@@ -195,102 +221,102 @@ bool opr_write(Client* cltP){
         return false;
     }
 
-    // Acquire read lock on [0, idx+1)
-    struct flock rdlock;
-    memset(&rdlock, 0, sizeof(rdlock));
-    rdlock.l_type = F_RDLCK;
-    rdlock.l_whence = SEEK_SET;
-    rdlock.l_start = 0;
-    rdlock.l_len = idx + 1;
-    if (fcntl(index, F_SETLKW, &rdlock) == -1) {
+    // acquire read lock on [0, idx+1)
+    struct flock rlock;
+    memset(&rlock, 0, sizeof(rlock));
+    rlock.l_type = F_RDLCK;
+    rlock.l_whence = SEEK_SET;
+    rlock.l_start = 0;
+    rlock.l_len = idx + 1;
+    if (fcntl(index, F_SETLKW, &rlock) == -1) {
         perror("fcntl read lock");
         close(note);
         close(index);
         return false;
     }
 
+    // get paragraph length and its start at note
     int head_length = 0, paragraph_length = -1, paragraph_count = 0;
     unsigned char hex;
     lseek(index, 0, SEEK_SET);
-    while (read(index, &hex, 1) > 0) {
+    for(; read(index, &hex, 1) > 0; paragraph_count++){
         int value = (int)hex;
         if (paragraph_count == idx) {
             paragraph_length = value;
             break;
         }
         head_length += value;
-        paragraph_count++;
     }
     if (paragraph_length == -1) {
         close(note);
         close(index);
         return false;
     }
-    int content_length = strlen(cltP->rbuffer + content_start);
-    if (content_length > MESSAGE_SIZE) {
-        content_length = MESSAGE_SIZE;
-    }
 
-    // Upgrade lock on byte idx to write lock
-    struct flock wrlock;
-    memset(&wrlock, 0, sizeof(wrlock));
-    wrlock.l_type = F_WRLCK;
-    wrlock.l_whence = SEEK_SET;
-    wrlock.l_start = idx;
-    wrlock.l_len = 1;
-    if (fcntl(index, F_SETLKW, &wrlock) == -1) {
-        perror("fcntl write lock on idx");
+    // unlock read lock on [0, idx)
+    struct flock unlock;
+    memset(&unlock, 0, sizeof(unlock));
+    unlock.l_type = F_UNLCK;
+    unlock.l_whence = SEEK_SET;
+    unlock.l_start = 0;
+    unlock.l_len = idx;
+    if (fcntl(index, F_SETLK, &unlock) == -1) {
+        perror("fcntl read lock");
         close(note);
         close(index);
         return false;
     }
 
-    // If size changes (B), acquire write lock on [idx, inf)
-    bool is_resize = (content_length != paragraph_length);
-    if (is_resize) {
-        struct flock suffixlock;
-        memset(&suffixlock, 0, sizeof(suffixlock));
-        suffixlock.l_type = F_WRLCK;
-        suffixlock.l_whence = SEEK_SET;
-        suffixlock.l_start = idx;
-        suffixlock.l_len = 0;
-        if (fcntl(index, F_SETLKW, &suffixlock) == -1) {
+    // set content
+    int content_length = min(strlen(cltP->rbuffer + content_start), MESSAGE_SIZE);
+    char content[content_length + 1];
+    memmove(content, cltP->rbuffer + content_start, content_length);
+    content[content_length] = '\0';
+
+    // blocking lock
+    if (content_length == paragraph_length) { // If size remains the same (A), acquire write lock on [idx, idx + 1)
+        printf("yes\n");
+        struct flock w_fin_lock;
+        memset(&w_fin_lock, 0, sizeof(w_fin_lock));
+        w_fin_lock.l_type = F_WRLCK;
+        w_fin_lock.l_whence = SEEK_SET;
+        w_fin_lock.l_start = idx;
+        w_fin_lock.l_len = 1;
+        if (fcntl(index, F_SETLKW, &w_fin_lock) == -1) {
+            perror("fcntl write lock on idx");
+            close(note);
+            close(index);
+            return false;
+        }
+        pwrite(note, content, content_length, head_length);
+    }
+    else { // If size changes (B), acquire write lock on [idx, inf)
+        struct flock w_inf_lock;
+        memset(&w_inf_lock, 0, sizeof(w_inf_lock));
+        w_inf_lock.l_type = F_WRLCK;
+        w_inf_lock.l_whence = SEEK_SET;
+        w_inf_lock.l_start = idx;
+        w_inf_lock.l_len = 0;
+        if (fcntl(index, F_SETLKW, &w_inf_lock) == -1) {
             perror("fcntl suffix lock");
             close(note);
             close(index);
             return false;
         }
-    }
 
-    char content[content_length + 1];
-    memmove(content, cltP->rbuffer + content_start, content_length);
-    content[content_length] = '\0';
-
-    int file_length = lseek(note, 0, SEEK_END);
-    int tail_length = file_length - head_length - paragraph_length;
-
-    char tail[tail_length];
-    if (lseek(note, head_length + paragraph_length, SEEK_SET) != -1) {
-        read(note, tail, tail_length);
-    }
-    if (lseek(note, head_length, SEEK_SET) != -1) {
-        write(note, content, content_length);
-        write(note, tail, tail_length);
-    }
-    if(paragraph_length > content_length){
-        ftruncate(note, head_length + content_length + tail_length);
+        int file_length = lseek(note, 0, SEEK_END);
+        int tail_length = file_length - head_length - paragraph_length;
+        char tail_content[tail_length];
+        pread(note, tail_content, tail_length, head_length + paragraph_length);
+        pwrite(note, content, content_length, head_length);
+        pwrite(note, tail_content, tail_length, head_length + content_length);
+        if(paragraph_length > content_length) ftruncate(note, head_length + content_length + tail_length);
     }
     unsigned char new_hex = (unsigned char)content_length;
-    if(lseek(index, paragraph_count, SEEK_SET) != -1){
-        write(index, &new_hex, 1);
-    }
-
-    if(fdatasync(note) == -1){
-        perror("sync note");
-    }
-    if(fdatasync(index) == -1){
-        perror("sync index");
-    }
+    pwrite(index, &new_hex, 1, paragraph_count);
+    
+    if(fdatasync(note) == -1) perror("sync note");
+    if(fdatasync(index) == -1) perror("sync index");
 
     close(note);
     close(index);
@@ -333,12 +359,8 @@ int main(int argc, char** argv) {
         }
         int totalFds = poll(fdarr, clt_num, -1);
 
-        if(totalFds < 0){
-            perror("poll");
-        }
-        else if(totalFds == 0){
-            continue;
-        }
+        if(totalFds < 0) perror("poll");
+        else if(totalFds == 0) continue;
         else{
             fdarr_it = 1;
             for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
@@ -371,7 +393,7 @@ int main(int argc, char** argv) {
                             reset_client(it);
                         }
                     }
-                    else if(ret <= 0){ // client disconnected or error
+                    else if(ret <= 0){
                         disconnect_client(it);
                         clt_num--;
                     }
@@ -379,9 +401,7 @@ int main(int argc, char** argv) {
             }
             if(fdarr[0].revents & POLLIN){
                 int new_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addrlen);
-                if (new_fd == -1) {
-                    perror("accept");
-                }
+                if (new_fd == -1) perror("accept");
                 Client *new_clt = (Client *)malloc(sizeof(Client));
                 init_client(new_fd, new_clt);
                 tail->next = new_clt;
