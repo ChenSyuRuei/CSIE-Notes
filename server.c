@@ -117,10 +117,31 @@ bool opr_read(Client* cltP){
 
     int idx = atoi(cltP->rbuffer + 5);
     int note = open("./note.txt", O_RDONLY);
-    int index = open("./index", O_RDONLY);
+    int index = open("./index", O_RDWR);
+    if (note < 0 || index < 0) {
+        if (note >= 0) close(note);
+        if (index >= 0) close(index);
+        return false;
+    }
+
+    // Acquire read lock on [0, idx+1)
+    struct flock rdlock;
+    memset(&rdlock, 0, sizeof(rdlock));
+    rdlock.l_type = F_RDLCK;
+    rdlock.l_whence = SEEK_SET;
+    rdlock.l_start = 0;
+    rdlock.l_len = idx + 1;
+    if (fcntl(index, F_SETLKW, &rdlock) == -1) {
+        perror("fcntl read lock");
+        close(note);
+        close(index);
+        return false;
+    }
+
     int sum = 0, paragraph_length = -1, count = 0;
     unsigned char hex;
 
+    lseek(index, 0, SEEK_SET);
     while (read(index, &hex, 1) > 0) {
         int value = (int)hex;
         if(count == idx){
@@ -130,17 +151,20 @@ bool opr_read(Client* cltP){
         sum += value;
         count++;
     }
-    if(idx >= count && paragraph_length == -1){
+    if(paragraph_length == -1){
+        close(note);
+        close(index);
         return false;
     }
-
     char content[paragraph_length + 1];
-    if(lseek(note, sum, SEEK_SET) != -1){
-        read(note, content, paragraph_length);
-    }
+    lseek(note, sum, SEEK_SET);
+    read(note, content, paragraph_length);
+    content[paragraph_length] = '\0';
 
     handle_write(cltP, content, paragraph_length);
 
+    close(note);
+    close(index);
     return true;
 }
 
@@ -165,8 +189,29 @@ bool opr_write(Client* cltP){
     int idx = atoi(cltP->rbuffer + 7);
     int note = open("./note.txt", O_RDWR);
     int index = open("./index", O_RDWR);
+    if (note < 0 || index < 0) {
+        if (note >= 0) close(note);
+        if (index >= 0) close(index);
+        return false;
+    }
+
+    // Acquire read lock on [0, idx+1)
+    struct flock rdlock;
+    memset(&rdlock, 0, sizeof(rdlock));
+    rdlock.l_type = F_RDLCK;
+    rdlock.l_whence = SEEK_SET;
+    rdlock.l_start = 0;
+    rdlock.l_len = idx + 1;
+    if (fcntl(index, F_SETLKW, &rdlock) == -1) {
+        perror("fcntl read lock");
+        close(note);
+        close(index);
+        return false;
+    }
+
     int head_length = 0, paragraph_length = -1, paragraph_count = 0;
     unsigned char hex;
+    lseek(index, 0, SEEK_SET);
     while (read(index, &hex, 1) > 0) {
         int value = (int)hex;
         if (paragraph_count == idx) {
@@ -176,13 +221,47 @@ bool opr_write(Client* cltP){
         head_length += value;
         paragraph_count++;
     }
-    if (idx >= paragraph_count && paragraph_length == -1) {
+    if (paragraph_length == -1) {
+        close(note);
+        close(index);
         return false;
     }
     int content_length = strlen(cltP->rbuffer + content_start);
     if (content_length > MESSAGE_SIZE) {
         content_length = MESSAGE_SIZE;
     }
+
+    // Upgrade lock on byte idx to write lock
+    struct flock wrlock;
+    memset(&wrlock, 0, sizeof(wrlock));
+    wrlock.l_type = F_WRLCK;
+    wrlock.l_whence = SEEK_SET;
+    wrlock.l_start = idx;
+    wrlock.l_len = 1;
+    if (fcntl(index, F_SETLKW, &wrlock) == -1) {
+        perror("fcntl write lock on idx");
+        close(note);
+        close(index);
+        return false;
+    }
+
+    // If size changes (B), acquire write lock on [idx, inf)
+    bool is_resize = (content_length != paragraph_length);
+    if (is_resize) {
+        struct flock suffixlock;
+        memset(&suffixlock, 0, sizeof(suffixlock));
+        suffixlock.l_type = F_WRLCK;
+        suffixlock.l_whence = SEEK_SET;
+        suffixlock.l_start = idx;
+        suffixlock.l_len = 0;
+        if (fcntl(index, F_SETLKW, &suffixlock) == -1) {
+            perror("fcntl suffix lock");
+            close(note);
+            close(index);
+            return false;
+        }
+    }
+
     char content[content_length + 1];
     memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
@@ -213,6 +292,8 @@ bool opr_write(Client* cltP){
         perror("sync index");
     }
 
+    close(note);
+    close(index);
     return true;
 }
 
