@@ -123,7 +123,7 @@ bool opr_read(Client* cltP){
         return false;
     }
 
-    // acquire read lock on [0, idx+1)
+    // acquire read lock on [0, idx+1) in index
     struct flock rdlock;
     memset(&rdlock, 0, sizeof(rdlock));
     rdlock.l_type = F_RDLCK;
@@ -155,7 +155,7 @@ bool opr_read(Client* cltP){
         return false;
     }
 
-    // unlock read lock on [0, idx)
+    // unlock read lock on [0, idx) in index
     struct flock unlock;
     memset(&unlock, 0, sizeof(unlock));
     unlock.l_type = F_UNLCK;
@@ -221,7 +221,7 @@ bool opr_write(Client* cltP){
         return false;
     }
 
-    // acquire read lock on [0, idx+1)
+    // acquire read lock on [0, idx+1) in index
     struct flock rlock;
     memset(&rlock, 0, sizeof(rlock));
     rlock.l_type = F_RDLCK;
@@ -253,7 +253,7 @@ bool opr_write(Client* cltP){
         return false;
     }
 
-    // unlock read lock on [0, idx)
+    // unlock read lock on [0, idx) in index
     struct flock unlock;
     memset(&unlock, 0, sizeof(unlock));
     unlock.l_type = F_UNLCK;
@@ -267,30 +267,35 @@ bool opr_write(Client* cltP){
         return false;
     }
 
-    // set content
+    // define different types of lengths
     int content_length = min(strlen(cltP->rbuffer + content_start), MESSAGE_SIZE);
     char content[content_length + 1];
     memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
+    int file_length = lseek(note, 0, SEEK_END);
+    int tail_length = file_length - head_length - paragraph_length;
+    char tail_content[tail_length];
 
     // blocking lock
-    if (content_length == paragraph_length) { // If size remains the same (A), acquire write lock on [idx, idx + 1)
-        printf("yes\n");
+    if (content_length == paragraph_length) { // If size remains the same (A), acquire write lock on [idx, idx + 1) in note
         struct flock w_fin_lock;
         memset(&w_fin_lock, 0, sizeof(w_fin_lock));
         w_fin_lock.l_type = F_WRLCK;
         w_fin_lock.l_whence = SEEK_SET;
-        w_fin_lock.l_start = idx;
-        w_fin_lock.l_len = 1;
-        if (fcntl(index, F_SETLKW, &w_fin_lock) == -1) {
+        w_fin_lock.l_start = head_length;
+        w_fin_lock.l_len = paragraph_length;
+        if (fcntl(note, F_SETLKW, &w_fin_lock) == -1) {
             perror("fcntl write lock on idx");
             close(note);
             close(index);
             return false;
         }
+
+        //sleep(5);
+        //printf("client %d write\n", cltP->fd);
         pwrite(note, content, content_length, head_length);
     }
-    else { // If size changes (B), acquire write lock on [idx, inf)
+    else { // If size changes (B), acquire write lock on [idx, inf) in note
         struct flock w_inf_lock;
         memset(&w_inf_lock, 0, sizeof(w_inf_lock));
         w_inf_lock.l_type = F_WRLCK;
@@ -304,16 +309,16 @@ bool opr_write(Client* cltP){
             return false;
         }
 
-        int file_length = lseek(note, 0, SEEK_END);
-        int tail_length = file_length - head_length - paragraph_length;
-        char tail_content[tail_length];
+        //sleep(5);
+        //printf("client %d write\n", cltP->fd);
         pread(note, tail_content, tail_length, head_length + paragraph_length);
         pwrite(note, content, content_length, head_length);
         pwrite(note, tail_content, tail_length, head_length + content_length);
+        unsigned char new_hex = (unsigned char)content_length;
+        pwrite(index, &new_hex, 1, paragraph_count);
+
         if(paragraph_length > content_length) ftruncate(note, head_length + content_length + tail_length);
     }
-    unsigned char new_hex = (unsigned char)content_length;
-    pwrite(index, &new_hex, 1, paragraph_count);
     
     if(fdatasync(note) == -1) perror("sync note");
     if(fdatasync(index) == -1) perror("sync index");
