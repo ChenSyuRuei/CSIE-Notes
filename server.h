@@ -6,12 +6,22 @@
 #define MESSAGE_SIZE 200
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
+#define CHECK(syscall_expr) do { \
+    if ((syscall_expr) == -1) { \
+        fprintf(stderr, "System call error at %s:%d: %s\n", __FILE__, __LINE__, #syscall_expr); \
+        perror(" -> "); \
+        close(index); \
+        close(note); \
+        return false; \
+    } \
+} while (0)
 
 // Section Request
 typedef struct client{
     int fd;
     size_t rlength;
     char rbuffer[BUFFER_SIZE];
+    bool rbuffer_clamped;
     size_t wlength;
     char wbuffer[BUFFER_SIZE];
     short pollout;

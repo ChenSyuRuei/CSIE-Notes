@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <errno.h>
 
@@ -17,7 +18,21 @@
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
+#ifndef CHECK
+#define CHECK(syscall_expr) do { \
+    if ((syscall_expr) == -1) { \
+        fprintf(stderr, "System call error at %s:%d: %s\n", __FILE__, __LINE__, #syscall_expr); \
+        perror(" -> "); \
+        close(index); \
+        close(note); \
+        return false; \
+    } \
+} while (0)
+#endif
+
 const char IAC_IP[3] = "\xff\xf4";
+
+int paragraph_total = 0;
 
 int handle_read(Client* cltP) {
     /*
@@ -36,8 +51,10 @@ int handle_read(Client* cltP) {
 
     memset(buffer, 0, sizeof(buffer));
     msg_length = read(cltP->fd, buffer, sizeof(buffer));
-    if (msg_length < 0) return -1;
+    if (msg_length == -1) return -1;
     if (msg_length == 0) return 0;
+    if (space_left == 0) cltP->rbuffer_clamped = true;
+
     char* p1 = strstr(buffer, "\015\012"); // \r\n
     if (p1 == NULL) {
         p1 = strstr(buffer, "\012"); // \n
@@ -68,12 +85,14 @@ void handle_write(Client* cltP, char* msg, int len){
 void reset_client(Client* cltP) {
     cltP->rlength = 0;
     cltP->rbuffer[0] = '\0';
+    cltP->rbuffer_clamped = false;
 }
 
 void init_client(int fdP, Client* cltP) {
     cltP->fd = fdP;
     cltP->rlength = 0;
     cltP->rbuffer[0] = '\0';
+    cltP->rbuffer_clamped = false;
     cltP->wlength = 0;
     cltP->wbuffer[0] = '\0';
     cltP->pollout = 0;
@@ -84,37 +103,27 @@ void init_client(int fdP, Client* cltP) {
 void disconnect_client(Client* cltP) {
     close(cltP->fd);
     cltP->previous->next = cltP->next;
-    if(cltP->next != NULL) cltP->next->previous = cltP->previous;
+    if (cltP->next != NULL) cltP->next->previous = cltP->previous;
+    //printf("Client %d disconnected.\n", cltP->fd);
+
     Client *temp = cltP;
-    cltP = cltP->previous;
+    cltP = cltP->previous; // for next iteration in main loop
     free(temp);
-    printf("client disconnected\n");
 }
 
 bool opr_read(Client* cltP){
     // check if paragraph parameter is valid
-    bool nonz_digit = false;
-    int first_digit_pos = -1, last_digit_pos = -1;
     for(int i = 5; i < cltP->rlength; i++) {
         if(!isdigit(cltP->rbuffer[i])) {
             return false;
         }
-        else{
-            if(cltP->rbuffer[i] != '0'){
-                if(!nonz_digit){
-                    first_digit_pos = i;
-                    nonz_digit = true;
-                }
-                last_digit_pos = i;
-            }
-        }
     }
-    if(last_digit_pos - first_digit_pos >= 3){
-        return false;
-    }
+    errno = 0;
+    char *endptr;
+    long idx = strtol(cltP->rbuffer + 5, &endptr, 10);
+    if (errno != 0 || endptr == cltP->rbuffer + 5 || *endptr != '\0' || idx < 0 || idx >= paragraph_total || cltP->rbuffer_clamped) return false;
 
     // open note file
-    int idx = atoi(cltP->rbuffer + 5);
     int note = open("./note.txt", O_RDONLY);
     int index = open("./index", O_RDONLY);
     if (note < 0 || index < 0) {
@@ -123,55 +132,53 @@ bool opr_read(Client* cltP){
         return false;
     }
 
-    // acquire read lock on [0, idx+1) in index
-    struct flock rdlock;
-    memset(&rdlock, 0, sizeof(rdlock));
-    rdlock.l_type = F_RDLCK;
-    rdlock.l_whence = SEEK_SET;
-    rdlock.l_start = 0;
-    rdlock.l_len = idx + 1;
-    if (fcntl(index, F_SETLKW, &rdlock) == -1) {
-        perror("fcntl read lock");
-        close(note);
-        close(index);
-        return false;
-    }
+    // acquire read lock on [0, idx] in index
+    struct flock rdlock_idx;
+    memset(&rdlock_idx, 0, sizeof(rdlock_idx));
+    rdlock_idx.l_type = F_RDLCK;
+    rdlock_idx.l_whence = SEEK_SET;
+    rdlock_idx.l_start = 0;
+    rdlock_idx.l_len = idx + 1;
+    CHECK(fcntl(index, F_SETLKW, &rdlock_idx));
 
     // get paragraph length and its start at note
     int head_length = 0, paragraph_length = -1;
     unsigned char hex;
-    lseek(index, 0, SEEK_SET);
-    for(int paragraph_count = 0; read(index, &hex, 1) > 0; paragraph_count++){
+    CHECK(lseek(index, 0, SEEK_SET));
+    for (int i = 0; i <= idx; i++){
+        CHECK(read(index, &hex, 1));
         int value = (int)hex;
-        if(paragraph_count == idx){
+        if(i == idx){
             paragraph_length = value;
             break;
         }
         head_length += value;
     }
-    if(paragraph_length == -1){
-        close(note);
-        close(index);
-        return false;
-    }
 
     // unlock read lock on [0, idx) in index
-    struct flock unlock;
-    memset(&unlock, 0, sizeof(unlock));
-    unlock.l_type = F_UNLCK;
-    unlock.l_whence = SEEK_SET;
-    unlock.l_start = 0;
-    unlock.l_len = idx;
-    if (fcntl(index, F_SETLK, &unlock) == -1) {
-        perror("fcntl read lock");
-        close(note);
-        close(index);
-        return false;
-    }
+    struct flock unlock_idx;
+    memset(&unlock_idx, 0, sizeof(unlock_idx));
+    unlock_idx.l_type = F_UNLCK;
+    unlock_idx.l_whence = SEEK_SET;
+    unlock_idx.l_start = 0;
+    unlock_idx.l_len = idx;
+    CHECK(fcntl(index, F_SETLK, &unlock_idx));
+
+    // acquire read lock on [head_length, head_length + paragraph_length] in index
+    struct flock rdlock_note;
+    memset(&rdlock_note, 0, sizeof(rdlock_note));
+    rdlock_note.l_type = F_RDLCK;
+    rdlock_note.l_whence = SEEK_SET;
+    rdlock_note.l_start = head_length;
+    rdlock_note.l_len = paragraph_length;
+    CHECK(fcntl(note, F_SETLKW, &rdlock_note));
+
+    //sleep(5);
+    //printf("client %d read\n", cltP->fd);
 
     // set content
     char content[paragraph_length + 1];
-    pread(note, content, paragraph_length, head_length);
+    CHECK(pread(note, content, paragraph_length, head_length));
     content[paragraph_length] = '\0';
 
     handle_write(cltP, content, paragraph_length);
@@ -184,35 +191,24 @@ bool opr_read(Client* cltP){
 bool opr_write(Client* cltP){
     // check if paragraph parameter is valid
     int content_start = -1;
-    bool nonz_digit = false;
-    int first_digit_pos = -1, last_digit_pos = -1;
-    for(int i = 7; i < cltP->rlength; i++) {
-        if(!isdigit(cltP->rbuffer[i])) {
+    for (int i = 7; i < cltP->rlength; i++) {
+        if (!isdigit(cltP->rbuffer[i])) {
             if (cltP->rbuffer[i] == ' ') {
                 cltP->rbuffer[i] = '\0';
                 content_start = i + 1;
                 break;
-            }
-            else {
+            } else {
                 return false;
             }
         }
-        else{
-            if(cltP->rbuffer[i] != '0'){
-                if(!nonz_digit){
-                    first_digit_pos = i;
-                    nonz_digit = true;
-                }
-                last_digit_pos = i;
-            }
-        }
-    }
-    if(last_digit_pos - first_digit_pos >= 3 || content_start == -1){
-        return false;
     }
 
+    errno = 0;
+    char *endptr;
+    long idx = strtol(cltP->rbuffer + 7, &endptr, 10);
+    if (errno != 0 || endptr == cltP->rbuffer + 7 || *endptr != '\0' || idx < 0 || idx >= paragraph_total || content_start == -1) return false;
+
     // open note file
-    int idx = atoi(cltP->rbuffer + 7);
     int note = open("./note.txt", O_RDWR);
     int index = open("./index", O_RDWR);
     if (note < 0 || index < 0) {
@@ -228,29 +224,20 @@ bool opr_write(Client* cltP){
     rlock.l_whence = SEEK_SET;
     rlock.l_start = 0;
     rlock.l_len = idx + 1;
-    if (fcntl(index, F_SETLKW, &rlock) == -1) {
-        perror("fcntl read lock");
-        close(note);
-        close(index);
-        return false;
-    }
+    CHECK(fcntl(index, F_SETLKW, &rlock));
 
     // get paragraph length and its start at note
-    int head_length = 0, paragraph_length = -1, paragraph_count = 0;
+    int head_length = 0, paragraph_length = -1;
     unsigned char hex;
-    lseek(index, 0, SEEK_SET);
-    for(; read(index, &hex, 1) > 0; paragraph_count++){
+    CHECK(lseek(index, 0, SEEK_SET));
+    for (int i = 0; i <= idx; i++){
+        CHECK(read(index, &hex, 1));
         int value = (int)hex;
-        if (paragraph_count == idx) {
+        if(i == idx){
             paragraph_length = value;
             break;
         }
         head_length += value;
-    }
-    if (paragraph_length == -1) {
-        close(note);
-        close(index);
-        return false;
     }
 
     // unlock read lock on [0, idx) in index
@@ -260,68 +247,65 @@ bool opr_write(Client* cltP){
     unlock.l_whence = SEEK_SET;
     unlock.l_start = 0;
     unlock.l_len = idx;
-    if (fcntl(index, F_SETLK, &unlock) == -1) {
-        perror("fcntl read lock");
-        close(note);
-        close(index);
-        return false;
-    }
+    CHECK(fcntl(index, F_SETLK, &unlock));
 
     // define different types of lengths
     int content_length = min(strlen(cltP->rbuffer + content_start), MESSAGE_SIZE);
     char content[content_length + 1];
     memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
+
     int file_length = lseek(note, 0, SEEK_END);
+    CHECK(file_length);
+
     int tail_length = file_length - head_length - paragraph_length;
-    char tail_content[tail_length];
+    char tail_content[tail_length + 1];
 
     // blocking lock
-    if (content_length == paragraph_length) { // If size remains the same (A), acquire write lock on [idx, idx + 1) in note
-        struct flock w_fin_lock;
-        memset(&w_fin_lock, 0, sizeof(w_fin_lock));
-        w_fin_lock.l_type = F_WRLCK;
-        w_fin_lock.l_whence = SEEK_SET;
-        w_fin_lock.l_start = head_length;
-        w_fin_lock.l_len = paragraph_length;
-        if (fcntl(note, F_SETLKW, &w_fin_lock) == -1) {
-            perror("fcntl write lock on idx");
-            close(note);
-            close(index);
-            return false;
-        }
+    if (content_length == paragraph_length) { // If size remains the same (A), acquire write lock on [idx, idx] in index, [head_length, head_length + content_length] in note
+        struct flock wrlock_note;
+        memset(&wrlock_note, 0, sizeof(wrlock_note));
+        wrlock_note.l_type = F_WRLCK;
+        wrlock_note.l_whence = SEEK_SET;
+        wrlock_note.l_start = head_length;
+        wrlock_note.l_len = content_length;
+        CHECK(fcntl(note, F_SETLKW, &wrlock_note));
 
         //sleep(5);
         //printf("client %d write\n", cltP->fd);
-        pwrite(note, content, content_length, head_length);
+        CHECK(pwrite(note, content, content_length, head_length));
     }
-    else { // If size changes (B), acquire write lock on [idx, inf) in note
-        struct flock w_inf_lock;
-        memset(&w_inf_lock, 0, sizeof(w_inf_lock));
-        w_inf_lock.l_type = F_WRLCK;
-        w_inf_lock.l_whence = SEEK_SET;
-        w_inf_lock.l_start = idx;
-        w_inf_lock.l_len = 0;
-        if (fcntl(index, F_SETLKW, &w_inf_lock) == -1) {
-            perror("fcntl suffix lock");
-            close(note);
-            close(index);
-            return false;
-        }
+    else { // If size changes (B), acquire write lock on [idx, inf) in index, [head_length, inf) in note 
+        struct flock wrlock_index;
+        memset(&wrlock_index, 0, sizeof(wrlock_index));
+        wrlock_index.l_type = F_WRLCK;
+        wrlock_index.l_whence = SEEK_SET;
+        wrlock_index.l_start = idx;
+        wrlock_index.l_len = 0;
+        CHECK(fcntl(index, F_SETLKW, &wrlock_index));
+
+        struct flock wrlock_note;
+        memset(&wrlock_note, 0, sizeof(wrlock_note));
+        wrlock_note.l_type = F_WRLCK;
+        wrlock_note.l_whence = SEEK_SET;
+        wrlock_note.l_start = head_length;
+        wrlock_note.l_len = 0;
+        CHECK(fcntl(note, F_SETLKW, &wrlock_note));
 
         //sleep(5);
         //printf("client %d write\n", cltP->fd);
-        pread(note, tail_content, tail_length, head_length + paragraph_length);
-        pwrite(note, content, content_length, head_length);
-        pwrite(note, tail_content, tail_length, head_length + content_length);
         unsigned char new_hex = (unsigned char)content_length;
-        pwrite(index, &new_hex, 1, paragraph_count);
+        CHECK(pwrite(index, &new_hex, 1, idx));
+        CHECK(pread(note, tail_content, tail_length, head_length + paragraph_length));
+        tail_content[tail_length] = '\0';
+        CHECK(pwrite(note, content, content_length, head_length));
+        CHECK(pwrite(note, tail_content, tail_length, head_length + content_length));
 
-        if(paragraph_length > content_length) ftruncate(note, head_length + content_length + tail_length);
+        if (paragraph_length > content_length) ftruncate(note, head_length + content_length + tail_length);
     }
     
-    if(fdatasync(note) == -1) perror("sync note");
-    if(fdatasync(index) == -1) perror("sync index");
+    if (fdatasync(note) == -1) perror("sync note");
+    if (fdatasync(index) == -1) perror("sync index");
 
     close(note);
     close(index);
@@ -351,69 +335,68 @@ int main(int argc, char** argv) {
     int clt_num = 1;
     Client clt;
     Client *tail = &clt;
-    struct pollfd fdarr[101];
+    struct pollfd fdarr[101] = {(struct pollfd){listen_fd, POLLIN, 0}};
+    int fdarr_it;
+    struct stat st;
+    if (stat("./index", &st) == -1) exit(EXIT_FAILURE);
+    paragraph_total = st.st_size;
 
     init_client(listen_fd, &clt);
-    fdarr[0] = (struct pollfd){listen_fd, POLLIN, 0};
-    int fdarr_it;
 
     while (true) {
         fdarr_it = 1;
-        for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
+        for (Client *it = clt.next; it != NULL; it = it->next, fdarr_it++) {
             fdarr[fdarr_it] = (struct pollfd){it->fd, POLLIN | it->pollout, 0};
         }
         int totalFds = poll(fdarr, clt_num, -1);
 
-        if(totalFds < 0) perror("poll");
-        else if(totalFds == 0) continue;
-        else{
+        if (totalFds < 0) perror("poll");
+        else if (totalFds == 0) continue;
+        else {
             fdarr_it = 1;
-            for(Client *it = clt.next; it != NULL; it = it->next, fdarr_it++){
-                if(fdarr[fdarr_it].revents & POLLOUT){
+            for (Client *it = clt.next; it != NULL; it = it->next, fdarr_it++) {
+                if (fdarr[fdarr_it].revents & POLLOUT) {
                     write(it->fd, it->wbuffer, it->wlength);
                     it->pollout = 0;
                 }
-                if(fdarr[fdarr_it].revents & POLLIN){
+                if (fdarr[fdarr_it].revents & POLLIN) {
                     int ret = handle_read(it);
                     if (ret == 1) {
-                        printf("read from client: %s\n", it->rbuffer);
-                        if(strncmp(it->rbuffer, "read ", 5) == 0) {
-                            if(!opr_read(it)){
+                        if (strncmp(it->rbuffer, "read ", 5) == 0 && it->pollout == 0) {
+                            if (!opr_read(it)) {
                                 handle_write(it, "Invalid command", 15);
                             }
                             reset_client(it);
-                        }
-                        else if(strncmp(it->rbuffer, "update ", 7) == 0) {
-                            if(!opr_write(it)){
+                        } else if (strncmp(it->rbuffer, "update ", 7) == 0) {
+                            if (!opr_write(it)){
                                 handle_write(it, "Invalid command", 15);
                             }
                             reset_client(it);
-                        }
-                        else if(strncmp(it->rbuffer, "exit", 5) == 0) {
+                        } else if (strncmp(it->rbuffer, "exit", 5) == 0) {
                             disconnect_client(it);
                             clt_num--;
-                        }
-                        else{
+                        } else {
                             handle_write(it, "Invalid command", 15);
                             reset_client(it);
                         }
-                    }
-                    else if(ret <= 0){
+                    } else if(ret <= 0) {
                         disconnect_client(it);
                         clt_num--;
                     }
                 }
             }
-            if(fdarr[0].revents & POLLIN){
+            if (fdarr[0].revents & POLLIN) {
                 int new_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addrlen);
                 if (new_fd == -1) perror("accept");
+
                 Client *new_clt = (Client *)malloc(sizeof(Client));
                 init_client(new_fd, new_clt);
                 tail->next = new_clt;
                 new_clt->previous = tail;
                 tail = new_clt;
                 clt_num++;
-                printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
+
+                //printf("New connection from %s on socket %d\n", inet_ntoa(client_addr.sin_addr), new_fd);
             }
         }
     }
