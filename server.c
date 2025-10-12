@@ -18,14 +18,23 @@
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
 
-#ifndef CHECK
-#define CHECK(syscall_expr) do { \
+#ifndef CHECK_FUNC
+#define CHECK_FUNC(syscall_expr) do { \
     if ((syscall_expr) == -1) { \
         fprintf(stderr, "System call error at %s:%d: %s\n", __FILE__, __LINE__, #syscall_expr); \
         perror(" -> "); \
         close(index); \
         close(note); \
         return false; \
+    } \
+} while (0)
+#endif
+
+#ifndef CHECK_MAIN
+#define CHECK_MAIN(syscall_expr) do { \
+    if ((syscall_expr) == -1) { \
+        fprintf(stderr, "System call error at %s:%d: %s\n", __FILE__, __LINE__, #syscall_expr); \
+        perror(" -> "); \
     } \
 } while (0)
 #endif
@@ -100,14 +109,14 @@ void init_client(int fdP, Client* cltP) {
     cltP->next = NULL;
 }
 
-void disconnect_client(Client* cltP) {
-    close(cltP->fd);
-    cltP->previous->next = cltP->next;
-    if (cltP->next != NULL) cltP->next->previous = cltP->previous;
+void disconnect_client(Client** cltP) {
+    close((*cltP)->fd);
+    (*cltP)->previous->next = (*cltP)->next;
+    if ((*cltP)->next != NULL) (*cltP)->next->previous = (*cltP)->previous;
     //printf("Client %d disconnected.\n", cltP->fd);
 
-    Client *temp = cltP;
-    cltP = cltP->previous; // for next iteration in main loop
+    Client *temp = *cltP;
+    *cltP = (*cltP)->previous; // for next iteration in main loop
     free(temp);
 }
 
@@ -139,14 +148,14 @@ bool opr_read(Client* cltP){
     rdlock_idx.l_whence = SEEK_SET;
     rdlock_idx.l_start = 0;
     rdlock_idx.l_len = idx + 1;
-    CHECK(fcntl(index, F_SETLKW, &rdlock_idx));
+    CHECK_FUNC(fcntl(index, F_SETLKW, &rdlock_idx));
 
     // get paragraph length and its start at note
     int head_length = 0, paragraph_length = -1;
     unsigned char hex;
-    CHECK(lseek(index, 0, SEEK_SET));
+    CHECK_FUNC(lseek(index, 0, SEEK_SET));
     for (int i = 0; i <= idx; i++){
-        CHECK(read(index, &hex, 1));
+        CHECK_FUNC(read(index, &hex, 1));
         int value = (int)hex;
         if(i == idx){
             paragraph_length = value;
@@ -162,23 +171,14 @@ bool opr_read(Client* cltP){
     unlock_idx.l_whence = SEEK_SET;
     unlock_idx.l_start = 0;
     unlock_idx.l_len = idx;
-    CHECK(fcntl(index, F_SETLK, &unlock_idx));
-
-    // acquire read lock on [head_length, head_length + paragraph_length] in index
-    struct flock rdlock_note;
-    memset(&rdlock_note, 0, sizeof(rdlock_note));
-    rdlock_note.l_type = F_RDLCK;
-    rdlock_note.l_whence = SEEK_SET;
-    rdlock_note.l_start = head_length;
-    rdlock_note.l_len = paragraph_length;
-    CHECK(fcntl(note, F_SETLKW, &rdlock_note));
+    CHECK_FUNC(fcntl(index, F_SETLK, &unlock_idx));
 
     //sleep(5);
     //printf("client %d read\n", cltP->fd);
 
     // set content
     char content[paragraph_length + 1];
-    CHECK(pread(note, content, paragraph_length, head_length));
+    CHECK_FUNC(pread(note, content, paragraph_length, head_length));
     content[paragraph_length] = '\0';
 
     handle_write(cltP, content, paragraph_length);
@@ -206,7 +206,7 @@ bool opr_write(Client* cltP){
     errno = 0;
     char *endptr;
     long idx = strtol(cltP->rbuffer + 7, &endptr, 10);
-    if (errno != 0 || endptr == cltP->rbuffer + 7 || *endptr != '\0' || idx < 0 || idx >= paragraph_total || content_start == -1) return false;
+    if (errno != 0 || endptr == cltP->rbuffer + 7 || *endptr != '\0' || idx < 0 || idx >= paragraph_total || content_start == -1 || content_start == cltP->rlength) return false;
 
     // open note file
     int note = open("./note.txt", O_RDWR);
@@ -224,14 +224,14 @@ bool opr_write(Client* cltP){
     rlock.l_whence = SEEK_SET;
     rlock.l_start = 0;
     rlock.l_len = idx + 1;
-    CHECK(fcntl(index, F_SETLKW, &rlock));
+    CHECK_FUNC(fcntl(index, F_SETLKW, &rlock));
 
     // get paragraph length and its start at note
     int head_length = 0, paragraph_length = -1;
     unsigned char hex;
-    CHECK(lseek(index, 0, SEEK_SET));
+    CHECK_FUNC(lseek(index, 0, SEEK_SET));
     for (int i = 0; i <= idx; i++){
-        CHECK(read(index, &hex, 1));
+        CHECK_FUNC(read(index, &hex, 1));
         int value = (int)hex;
         if(i == idx){
             paragraph_length = value;
@@ -247,7 +247,7 @@ bool opr_write(Client* cltP){
     unlock.l_whence = SEEK_SET;
     unlock.l_start = 0;
     unlock.l_len = idx;
-    CHECK(fcntl(index, F_SETLK, &unlock));
+    CHECK_FUNC(fcntl(index, F_SETLK, &unlock));
 
     // define different types of lengths
     int content_length = min(strlen(cltP->rbuffer + content_start), MESSAGE_SIZE);
@@ -255,8 +255,8 @@ bool opr_write(Client* cltP){
     memmove(content, cltP->rbuffer + content_start, content_length);
     content[content_length] = '\0';
 
-    int file_length = lseek(note, 0, SEEK_END);
-    CHECK(file_length);
+    int file_length;
+    CHECK_FUNC(file_length = lseek(note, 0, SEEK_END));
 
     int tail_length = file_length - head_length - paragraph_length;
     char tail_content[tail_length + 1];
@@ -269,11 +269,11 @@ bool opr_write(Client* cltP){
         wrlock_note.l_whence = SEEK_SET;
         wrlock_note.l_start = head_length;
         wrlock_note.l_len = content_length;
-        CHECK(fcntl(note, F_SETLKW, &wrlock_note));
+        CHECK_FUNC(fcntl(note, F_SETLKW, &wrlock_note));
 
         //sleep(5);
         //printf("client %d write\n", cltP->fd);
-        CHECK(pwrite(note, content, content_length, head_length));
+        CHECK_FUNC(pwrite(note, content, content_length, head_length));
     }
     else { // If size changes (B), acquire write lock on [idx, inf) in index, [head_length, inf) in note 
         struct flock wrlock_index;
@@ -282,33 +282,25 @@ bool opr_write(Client* cltP){
         wrlock_index.l_whence = SEEK_SET;
         wrlock_index.l_start = idx;
         wrlock_index.l_len = 0;
-        CHECK(fcntl(index, F_SETLKW, &wrlock_index));
-
-        struct flock wrlock_note;
-        memset(&wrlock_note, 0, sizeof(wrlock_note));
-        wrlock_note.l_type = F_WRLCK;
-        wrlock_note.l_whence = SEEK_SET;
-        wrlock_note.l_start = head_length;
-        wrlock_note.l_len = 0;
-        CHECK(fcntl(note, F_SETLKW, &wrlock_note));
+        CHECK_FUNC(fcntl(index, F_SETLKW, &wrlock_index));
 
         //sleep(5);
         //printf("client %d write\n", cltP->fd);
         unsigned char new_hex = (unsigned char)content_length;
-        CHECK(pwrite(index, &new_hex, 1, idx));
-        CHECK(pread(note, tail_content, tail_length, head_length + paragraph_length));
+        CHECK_FUNC(pwrite(index, &new_hex, 1, idx));
+        CHECK_FUNC(pread(note, tail_content, tail_length, head_length + paragraph_length));
         tail_content[tail_length] = '\0';
-        CHECK(pwrite(note, content, content_length, head_length));
-        CHECK(pwrite(note, tail_content, tail_length, head_length + content_length));
+        CHECK_FUNC(pwrite(note, content, content_length, head_length));
+        CHECK_FUNC(pwrite(note, tail_content, tail_length, head_length + content_length));
 
-        if (paragraph_length > content_length) ftruncate(note, head_length + content_length + tail_length);
+        if (paragraph_length > content_length) CHECK_MAIN(ftruncate(note, head_length + content_length + tail_length));
     }
-    
-    if (fdatasync(note) == -1) perror("sync note");
-    if (fdatasync(index) == -1) perror("sync index");
 
-    close(note);
+    CHECK_MAIN(fdatasync(index) == -1);
+    CHECK_MAIN(fdatasync(note) == -1);
+
     close(index);
+    close(note);
     return true;
 }
 
@@ -356,31 +348,31 @@ int main(int argc, char** argv) {
             fdarr_it = 1;
             for (Client *it = clt.next; it != NULL; it = it->next, fdarr_it++) {
                 if (fdarr[fdarr_it].revents & POLLOUT) {
-                    write(it->fd, it->wbuffer, it->wlength);
+                    CHECK_MAIN(write(it->fd, it->wbuffer, it->wlength));
                     it->pollout = 0;
                 }
                 if (fdarr[fdarr_it].revents & POLLIN) {
                     int ret = handle_read(it);
                     if (ret == 1) {
                         if (strncmp(it->rbuffer, "read ", 5) == 0 && it->pollout == 0) {
-                            if (!opr_read(it)) {
-                                handle_write(it, "Invalid command", 15);
-                            }
+                            if (!opr_read(it)) handle_write(it, "Invalid command", 15);
                             reset_client(it);
-                        } else if (strncmp(it->rbuffer, "update ", 7) == 0) {
-                            if (!opr_write(it)){
-                                handle_write(it, "Invalid command", 15);
-                            }
+                        } 
+                        else if (strncmp(it->rbuffer, "update ", 7) == 0) {
+                            if (!opr_write(it)) handle_write(it, "Invalid command", 15);
                             reset_client(it);
-                        } else if (strncmp(it->rbuffer, "exit", 5) == 0) {
-                            disconnect_client(it);
+                        } 
+                        else if (strncmp(it->rbuffer, "exit", 5) == 0) {
+                            disconnect_client(&it);
                             clt_num--;
-                        } else {
+                        } 
+                        else {
                             handle_write(it, "Invalid command", 15);
                             reset_client(it);
                         }
-                    } else if(ret <= 0) {
-                        disconnect_client(it);
+                    } 
+                    else if(ret <= 0) {
+                        disconnect_client(&it);
                         clt_num--;
                     }
                 }
